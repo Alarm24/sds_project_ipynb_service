@@ -4,6 +4,11 @@ from html import escape as html_escape
 from flask import Flask, jsonify, request
 import nbformat
 from nbconvert import HTMLExporter
+try:
+    from mistune import HTMLRenderer, create_markdown
+except ImportError:
+    HTMLRenderer = None
+    create_markdown = None
 
 
 MAX_NOTEBOOK_SIZE = 5 * 1024 * 1024  # 5 MB ceiling for uploads
@@ -13,6 +18,14 @@ if not logging.getLogger().hasHandlers():
 
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
+if create_markdown and HTMLRenderer:
+    try:
+        MARKDOWN_RENDERER = create_markdown(renderer=HTMLRenderer(escape=True))
+    except Exception:
+        logger.exception("Failed initializing mistune markdown renderer")
+        MARKDOWN_RENDERER = None
+else:
+    MARKDOWN_RENDERER = None
 
 
 @app.route('/convert', methods=['POST'])
@@ -79,6 +92,9 @@ def create_simple_html(notebook, title='Notebook Preview'):
         ".code-cell { border-left: 4px solid #4c6ef5; }",
         ".markdown-cell { border-left: 4px solid #2f9e44; }",
         "pre { background: #1e1e1e; color: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto; }",
+        ".markdown-body { line-height: 1.6; }",
+        ".markdown-body pre { background: #f1f3f5; color: #212529; }",
+        ".markdown-body code { background: #f1f3f5; color: #212529; padding: 2px 4px; border-radius: 3px; }",
         ".output { margin-top: 12px; padding: 12px; background: #fafafa; border: 1px solid #e5e5e5; border-radius: 4px; }",
         "</style>",
         "</head>",
@@ -108,7 +124,7 @@ def create_simple_html(notebook, title='Notebook Preview'):
         elif cell.cell_type == 'markdown':
             html_parts.append('<section class="cell markdown-cell">')
             html_parts.append("<h3>Markdown</h3>")
-            html_parts.append(f"<pre>{escape_html(cell.source)}</pre>")
+            html_parts.append(render_markdown_html(cell.source))
             html_parts.append('</section>')
         else:
             html_parts.append('<section class="cell">')
@@ -141,6 +157,23 @@ def extract_output_text(output):
 def escape_html(text):
     """Escape HTML characters safely."""
     return html_escape(text or "", quote=True)
+
+
+def render_markdown_html(source):
+    """Render markdown content using mistune when available."""
+    if not source:
+        return '<div class="markdown-body"></div>'
+
+    if MARKDOWN_RENDERER is None:
+        return f"<pre>{escape_html(source)}</pre>"
+
+    try:
+        rendered = MARKDOWN_RENDERER(source)
+    except Exception:
+        logger.exception("Mistune failed rendering markdown content")
+        return f"<pre>{escape_html(source)}</pre>"
+
+    return f'<div class="markdown-body">{rendered}</div>'
 
 
 if __name__ == '__main__':
