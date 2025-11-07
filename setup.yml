@@ -1,0 +1,173 @@
+---
+- name: Install MicroK8s prerequisites on all nodes
+  hosts: all
+  become: true
+  vars:
+    microk8s_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+  tasks:
+    - name: Refresh APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install snapd
+      ansible.builtin.apt:
+        name: snapd
+        state: present
+
+    - name: Ensure snapd service is enabled
+      ansible.builtin.systemd:
+        name: snapd
+        enabled: true
+        state: started
+
+    - name: Install MicroK8s via snap
+      ansible.builtin.command:
+        cmd: snap install microk8s --classic
+        creates: /snap/bin/microk8s
+
+    - name: Lookup MicroK8s user details
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ microk8s_user }}"
+      register: microk8s_user_entry
+
+    - name: Set MicroK8s user home directory
+      ansible.builtin.set_fact:
+        microk8s_user_home: "{{ microk8s_user_entry.ansible_facts.getent_passwd[microk8s_user][5] }}"
+
+    - name: Ensure user bashrc exists
+      ansible.builtin.file:
+        path: "{{ microk8s_user_home }}/.bashrc"
+        state: touch
+        owner: "{{ microk8s_user }}"
+        group: "{{ microk8s_user }}"
+        mode: '0644'
+
+    - name: Append snap bin path to bashrc
+      ansible.builtin.lineinfile:
+        path: "{{ microk8s_user_home }}/.bashrc"
+        line: 'export PATH=$PATH:/snap/bin'
+        state: present
+        create: true
+
+    - name: Ensure user in microk8s group
+      ansible.builtin.user:
+        name: "{{ microk8s_user }}"
+        groups: microk8s
+        append: true
+
+- name: Configure MicroK8s control plane
+  hosts: master
+  become: true
+  vars:
+    microk8s_kubeconfig_src: /var/snap/microk8s/current/credentials/client.config
+    microk8s_token_ttl: 7200
+  tasks:
+    - name: Wait for MicroK8s readiness
+      ansible.builtin.command: microk8s status --wait-ready
+      changed_when: false
+
+    - name: Determine non-root user for kubectl access
+      ansible.builtin.set_fact:
+        kubeconfig_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+
+    - name: Lookup kubeconfig user info
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ kubeconfig_user }}"
+      register: kubeconfig_user_entry
+      when: kubeconfig_user != 'root'
+
+    - name: Set kubeconfig user home
+      ansible.builtin.set_fact:
+        kubeconfig_user_home: "{{ kubeconfig_user_entry.ansible_facts.getent_passwd[kubeconfig_user][5] }}"
+      when: kubeconfig_user != 'root'
+
+    - name: Ensure root kube config directory exists
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Copy MicroK8s kubeconfig for root
+      ansible.builtin.copy:
+        src: "{{ microk8s_kubeconfig_src }}"
+        dest: /root/.kube/config
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Ensure kubeconfig directory for user
+      ansible.builtin.file:
+        path: "{{ kubeconfig_user_home }}/.kube"
+        state: directory
+        owner: "{{ kubeconfig_user }}"
+        group: "{{ kubeconfig_user }}"
+        mode: '0700'
+      when: kubeconfig_user != 'root'
+
+    - name: Copy MicroK8s kubeconfig for user
+      ansible.builtin.copy:
+        src: "{{ microk8s_kubeconfig_src }}"
+        dest: "{{ kubeconfig_user_home }}/.kube/config"
+        remote_src: true
+        owner: "{{ kubeconfig_user }}"
+        group: "{{ kubeconfig_user }}"
+        mode: '0600'
+      when: kubeconfig_user != 'root'
+
+    - name: Generate MicroK8s join information
+      ansible.builtin.command:
+        cmd: microk8s add-node --token-ttl {{ microk8s_token_ttl }} --format json
+      register: microk8s_add_node
+
+    - name: Cache MicroK8s join details
+      ansible.builtin.set_fact:
+        microk8s_join_details: "{{ microk8s_add_node.stdout | from_json }}"
+
+    - name: Share MicroK8s join facts
+      ansible.builtin.set_fact:
+        microk8s_worker_join_cmd: "{{ microk8s_join_details.get('worker-join-command') | default('microk8s join ' ~ microk8s_join_details.get('url', (ansible_host | default(ansible_default_ipv4.address)) ~ ':25000') ~ '/' ~ microk8s_join_details.get('token', '') ~ ' --worker') }}"
+
+- name: Join worker nodes to MicroK8s cluster
+  hosts: workers
+  become: true
+  vars:
+    master_host: "{{ groups['master'][0] }}"
+  tasks:
+    - name: Check MicroK8s installation
+      ansible.builtin.stat:
+        path: /snap/bin/microk8s
+      register: microk8s_snap
+
+    - name: Fail if MicroK8s missing
+      ansible.builtin.fail:
+        msg: "MicroK8s not installed on worker node"
+      when: not microk8s_snap.stat.exists
+
+    - name: Wait for local MicroK8s services
+      ansible.builtin.command: microk8s status --wait-ready
+      changed_when: false
+      failed_when: false
+
+    - name: Collect join command from master
+      ansible.builtin.set_fact:
+        microk8s_worker_join_cmd: "{{ hostvars[master_host].microk8s_worker_join_cmd }}"
+
+    - name: Normalize join command
+      ansible.builtin.set_fact:
+        microk8s_worker_join_exec: "{{ microk8s_worker_join_cmd | regex_replace('^sudo\\s+', '') | trim }}"
+
+    - name: Check current MicroK8s role
+      ansible.builtin.command: microk8s status --format short
+      register: microk8s_status
+      changed_when: false
+      failed_when: false
+
+    - name: Join MicroK8s cluster
+      ansible.builtin.shell: "{{ microk8s_worker_join_exec }}"
+      when: microk8s_worker_join_exec != '' and ('worker' not in (microk8s_status.stdout | default('')))
