@@ -102,6 +102,11 @@
       register: dns_enable
       changed_when: "'Nothing to do for addon dns' not in dns_enable.stdout"
 
+    - name: Enable built-in image registry (safe to re-run)
+      ansible.builtin.command: "{{ microk8s_bin }} enable registry"
+      register: registry_enable
+      changed_when: "'Nothing to do for addon registry' not in registry_enable.stdout"
+
     - name: Generate join token for workers
       ansible.builtin.command: "{{ microk8s_bin }} add-node --token-ttl 3600"
       register: add_node_raw
@@ -224,3 +229,42 @@
         IP_AUTODETECTION_METHOD=cidr={{ calico_autodetect_cidr }}
       register: calico_env
       changed_when: "'configured' in calico_env.stdout or 'set' in calico_env.stdout"
+
+- name: Deploy application stack to workers
+  hosts: master
+  become: true
+  vars:
+    microk8s_bin: /snap/bin/microk8s
+    snap_bin_path: /snap/bin
+    app_namespace: ipynb-stack
+    worker_label_key: microk8s_app_role
+    worker_label_value: worker
+    manifest_src: k8s/microk8s-stack.yaml
+    manifest_dest: /tmp/microk8s-stack.yaml
+  tasks:
+    - name: Ensure MicroK8s is ready on master
+      ansible.builtin.command: "{{ microk8s_bin }} status --wait-ready"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ snap_bin_path }}"
+      changed_when: false
+
+    - name: Label worker nodes for app scheduling
+      ansible.builtin.command: >-
+        {{ microk8s_bin }} kubectl label node {{ item_node_name }}
+        {{ worker_label_key }}={{ worker_label_value }} --overwrite
+      loop: "{{ groups['workers'] }}"
+      loop_control:
+        loop_var: item_host
+      vars:
+        item_node_name: "{{ hostvars[item_host].node_name | default(hostvars[item_host].ansible_hostname | default(item_host)) }}"
+
+    - name: Copy stack manifest to master
+      ansible.builtin.copy:
+        src: "{{ manifest_src }}"
+        dest: "{{ manifest_dest }}"
+        mode: "0644"
+
+    - name: Apply stack manifest
+      ansible.builtin.command: "{{ microk8s_bin }} kubectl apply -f {{ manifest_dest }}"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ snap_bin_path }}"

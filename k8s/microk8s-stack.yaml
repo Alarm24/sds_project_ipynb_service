@@ -1,0 +1,205 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ipynb-stack
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdf-converter
+  namespace: ipynb-stack
+  labels:
+    app: pdf-converter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pdf-converter
+  template:
+    metadata:
+      labels:
+        app: pdf-converter
+    spec:
+      nodeSelector:
+        microk8s_app_role: worker
+      containers:
+        - name: pdf-converter
+          image: kanisornp/sds-project-pdf-renderer:1.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pdf-converter
+  namespace: ipynb-stack
+spec:
+  selector:
+    app: pdf-converter
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30082
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ipynb-converter
+  namespace: ipynb-stack
+  labels:
+    app: ipynb-converter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ipynb-converter
+  template:
+    metadata:
+      labels:
+        app: ipynb-converter
+    spec:
+      nodeSelector:
+        microk8s_app_role: worker
+      containers:
+        - name: ipynb-converter
+          image: kanisornp/sds-project-html-converter:1.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5001
+          env:
+            - name: PORT
+              value: "5001"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ipynb-converter
+  namespace: ipynb-stack
+spec:
+  selector:
+    app: ipynb-converter
+  ports:
+    - name: http
+      port: 5001
+      targetPort: 5001
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: ipynb-stack
+  labels:
+    app: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      nodeSelector:
+        microk8s_app_role: worker
+      containers:
+        - name: gateway
+          image: kanisornp/sds-project-gateway:1.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: IPYNB_SERVICE
+              value: http://ipynb-converter:5001
+            - name: PDF_SERVICE
+              value: http://pdf-converter:8080
+            - name: PORT
+              value: "3000"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: ipynb-stack
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      nodePort: 30081
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: ipynb-stack
+  labels:
+    app: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      nodeSelector:
+        microk8s_app_role: worker
+      containers:
+        - name: frontend
+          image: kanisornp/sds-project-frontend:1.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: ipynb-stack
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      nodePort: 30080
+  type: NodePort
