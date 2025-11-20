@@ -1,173 +1,226 @@
 ---
-- name: Install MicroK8s prerequisites on all nodes
-  hosts: all
+- name: Install MicroK8s on all nodes
+  hosts: master:workers
   become: true
   vars:
-    microk8s_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    microk8s_snap_channel: "1.34/stable"
+    microk8s_bin: /snap/bin/microk8s
+    snap_bin_path: /snap/bin
+    kubelet_args_file: /var/snap/microk8s/current/args/kubelet
+    kubelet_node_ip: "{{ hostvars[inventory_hostname].node_ip | default(ansible_host) }}"
   tasks:
-    - name: Refresh APT cache
+    - name: Update apt cache (Debian/Ubuntu)
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
 
-    - name: Install snapd
+    - name: Ensure snapd is installed
       ansible.builtin.apt:
         name: snapd
         state: present
+      when: ansible_os_family == "Debian"
 
-    - name: Ensure snapd service is enabled
-      ansible.builtin.systemd:
-        name: snapd
-        enabled: true
-        state: started
+    - name: Install MicroK8s snap
+      ansible.builtin.command: "snap install microk8s --classic --channel={{ microk8s_snap_channel }}"
+      args:
+        creates: "{{ microk8s_bin }}"
 
-    - name: Install MicroK8s via snap
-      ansible.builtin.command:
-        cmd: snap install microk8s --classic
-        creates: /snap/bin/microk8s
-
-    - name: Lookup MicroK8s user details
-      ansible.builtin.getent:
-        database: passwd
-        key: "{{ microk8s_user }}"
-      register: microk8s_user_entry
-
-    - name: Set MicroK8s user home directory
-      ansible.builtin.set_fact:
-        microk8s_user_home: "{{ microk8s_user_entry.ansible_facts.getent_passwd[microk8s_user][5] }}"
-
-    - name: Ensure user bashrc exists
-      ansible.builtin.file:
-        path: "{{ microk8s_user_home }}/.bashrc"
-        state: touch
-        owner: "{{ microk8s_user }}"
-        group: "{{ microk8s_user }}"
-        mode: '0644'
-
-    - name: Append snap bin path to bashrc
-      ansible.builtin.lineinfile:
-        path: "{{ microk8s_user_home }}/.bashrc"
-        line: 'export PATH=$PATH:/snap/bin'
-        state: present
-        create: true
-
-    - name: Ensure user in microk8s group
+    - name: Add {{ ansible_user }} to the microk8s group
       ansible.builtin.user:
-        name: "{{ microk8s_user }}"
+        name: "{{ ansible_user }}"
         groups: microk8s
         append: true
 
-- name: Configure MicroK8s control plane
+    - name: Ensure kube config directory exists for {{ ansible_user }}
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir | default('/home/' + ansible_user) }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0750"
+
+    - name: Verify microk8s binary is present
+      ansible.builtin.stat:
+        path: "{{ microk8s_bin }}"
+      register: microk8s_bin_stat
+
+    - name: Fail if microk8s binary was not installed
+      ansible.builtin.fail:
+        msg: "MicroK8s binary not found at {{ microk8s_bin }} after installation."
+      when: not microk8s_bin_stat.stat.exists
+
+    - name: Pin kubelet node IP
+      ansible.builtin.lineinfile:
+        path: "{{ kubelet_args_file }}"
+        regexp: '^--node-ip='
+        line: "--node-ip={{ kubelet_node_ip }}"
+        state: present
+        create: yes
+        backrefs: false
+      notify: Restart microk8s
+
+    - name: Force kubelet to use /etc/resolv.conf
+      ansible.builtin.lineinfile:
+        path: "{{ kubelet_args_file }}"
+        regexp: '^--resolv-conf='
+        line: "--resolv-conf=/etc/resolv.conf"
+        state: present
+        create: yes
+        backrefs: false
+      notify: Restart microk8s
+
+    - name: Apply pending restarts before readiness checks
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for MicroK8s to become ready
+      ansible.builtin.command: "{{ microk8s_bin }} status --wait-ready"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ snap_bin_path }}"
+      changed_when: false
+
+  handlers:
+    - name: Restart microk8s
+      ansible.builtin.command: snap restart microk8s
+      changed_when: true
+
+- name: Configure master, generate token
   hosts: master
   become: true
   vars:
-    microk8s_kubeconfig_src: /var/snap/microk8s/current/credentials/client.config
-    microk8s_token_ttl: 7200
+    microk8s_bin: /snap/bin/microk8s
+    snap_bin_path: /snap/bin
   tasks:
-    - name: Wait for MicroK8s readiness
-      ansible.builtin.command: microk8s status --wait-ready
+    - name: Ensure MicroK8s is ready on master
+      ansible.builtin.command: "{{ microk8s_bin }} status --wait-ready"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ snap_bin_path }}"
       changed_when: false
 
-    - name: Determine non-root user for kubectl access
+    - name: Enable DNS addon (safe to re-run)
+      ansible.builtin.command: "{{ microk8s_bin }} enable dns"
+      register: dns_enable
+      changed_when: "'Nothing to do for addon dns' not in dns_enable.stdout"
+
+    - name: Generate join token for workers
+      ansible.builtin.command: "{{ microk8s_bin }} add-node --token-ttl 3600"
+      register: add_node_raw
+      changed_when: true
+
+    - name: Extract worker join command
       ansible.builtin.set_fact:
-        kubeconfig_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+        microk8s_join_command: >-
+          {{
+            (
+              add_node_raw.stdout_lines
+              | select('search', 'microk8s join')
+              | select('search', '--worker')
+              | list
+              | first
+            )
+            | default(
+              (add_node_raw.stdout_lines | select('search', 'microk8s join') | list | first),
+              true
+            )
+            | trim
+          }}
 
-    - name: Lookup kubeconfig user info
-      ansible.builtin.getent:
-        database: passwd
-        key: "{{ kubeconfig_user }}"
-      register: kubeconfig_user_entry
-      when: kubeconfig_user != 'root'
-
-    - name: Set kubeconfig user home
+    - name: Rewrite join command to use absolute microk8s path
       ansible.builtin.set_fact:
-        kubeconfig_user_home: "{{ kubeconfig_user_entry.ansible_facts.getent_passwd[kubeconfig_user][5] }}"
-      when: kubeconfig_user != 'root'
+        microk8s_join_command_bin: "{{ microk8s_join_command | regex_replace('^microk8s', microk8s_bin) }}"
 
-    - name: Ensure root kube config directory exists
-      ansible.builtin.file:
-        path: /root/.kube
-        state: directory
-        owner: root
-        group: root
-        mode: '0700'
+    - name: Fail if join command was not found
+      ansible.builtin.fail:
+        msg: "Could not parse a microk8s join command from add-node output."
+      when: microk8s_join_command is not defined or microk8s_join_command == ""
 
-    - name: Copy MicroK8s kubeconfig for root
-      ansible.builtin.copy:
-        src: "{{ microk8s_kubeconfig_src }}"
-        dest: /root/.kube/config
-        remote_src: true
-        owner: root
-        group: root
-        mode: '0600'
+    - name: Show join command in log
+      ansible.builtin.debug:
+        var: microk8s_join_command_bin
 
-    - name: Ensure kubeconfig directory for user
-      ansible.builtin.file:
-        path: "{{ kubeconfig_user_home }}/.kube"
-        state: directory
-        owner: "{{ kubeconfig_user }}"
-        group: "{{ kubeconfig_user }}"
-        mode: '0700'
-      when: kubeconfig_user != 'root'
-
-    - name: Copy MicroK8s kubeconfig for user
-      ansible.builtin.copy:
-        src: "{{ microk8s_kubeconfig_src }}"
-        dest: "{{ kubeconfig_user_home }}/.kube/config"
-        remote_src: true
-        owner: "{{ kubeconfig_user }}"
-        group: "{{ kubeconfig_user }}"
-        mode: '0600'
-      when: kubeconfig_user != 'root'
-
-    - name: Generate MicroK8s join information
-      ansible.builtin.command:
-        cmd: microk8s add-node --token-ttl {{ microk8s_token_ttl }} --format json
-      register: microk8s_add_node
-
-    - name: Cache MicroK8s join details
-      ansible.builtin.set_fact:
-        microk8s_join_details: "{{ microk8s_add_node.stdout | from_json }}"
-
-    - name: Share MicroK8s join facts
-      ansible.builtin.set_fact:
-        microk8s_worker_join_cmd: "{{ microk8s_join_details.get('worker-join-command') | default('microk8s join ' ~ microk8s_join_details.get('url', (ansible_host | default(ansible_default_ipv4.address)) ~ ':25000') ~ '/' ~ microk8s_join_details.get('token', '') ~ ' --worker') }}"
-
-- name: Join worker nodes to MicroK8s cluster
+- name: Join workers to the cluster
   hosts: workers
   become: true
   vars:
-    master_host: "{{ groups['master'][0] }}"
+    join_command: "{{ hostvars[groups['master'][0]].microk8s_join_command_bin | default('') }}"
+    microk8s_bin: /snap/bin/microk8s
+    snap_bin_path: /snap/bin
   tasks:
-    - name: Check MicroK8s installation
-      ansible.builtin.stat:
-        path: /snap/bin/microk8s
-      register: microk8s_snap
-
-    - name: Fail if MicroK8s missing
-      ansible.builtin.fail:
-        msg: "MicroK8s not installed on worker node"
-      when: not microk8s_snap.stat.exists
-
-    - name: Wait for local MicroK8s services
-      ansible.builtin.command: microk8s status --wait-ready
+    - name: Wait for MicroK8s to become ready on worker
+      ansible.builtin.command: "{{ microk8s_bin }} status --wait-ready"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ snap_bin_path }}"
       changed_when: false
-      failed_when: false
 
-    - name: Collect join command from master
-      ansible.builtin.set_fact:
-        microk8s_worker_join_cmd: "{{ hostvars[master_host].microk8s_worker_join_cmd }}"
+    - name: Ensure join command is available
+      ansible.builtin.assert:
+        that:
+          - join_command != ""
+        fail_msg: "Master did not publish a join command."
 
-    - name: Normalize join command
-      ansible.builtin.set_fact:
-        microk8s_worker_join_exec: "{{ microk8s_worker_join_cmd | regex_replace('^sudo\\s+', '') | trim }}"
+    - name: Join worker to the master
+      ansible.builtin.command: "{{ join_command }}"
+      register: join_result
+      changed_when: "'already part of the cluster' not in join_result.stdout"
 
-    - name: Check current MicroK8s role
-      ansible.builtin.command: microk8s status --format short
-      register: microk8s_status
+- name: Enforce kubelet network settings post-join (workers)
+  hosts: workers
+  become: true
+  vars:
+    microk8s_bin: /snap/bin/microk8s
+    snap_bin_path: /snap/bin
+    kubelet_args_file: /var/snap/microk8s/current/args/kubelet
+    kubelet_node_ip: "{{ hostvars[inventory_hostname].node_ip | default(ansible_host) }}"
+  tasks:
+    - name: Pin kubelet node IP
+      ansible.builtin.lineinfile:
+        path: "{{ kubelet_args_file }}"
+        regexp: '^--node-ip='
+        line: "--node-ip={{ kubelet_node_ip }}"
+        state: present
+        create: yes
+      notify: Restart microk8s service
+
+    - name: Force kubelet to use /etc/resolv.conf
+      ansible.builtin.lineinfile:
+        path: "{{ kubelet_args_file }}"
+        regexp: '^--resolv-conf='
+        line: "--resolv-conf=/etc/resolv.conf"
+        state: present
+        create: yes
+      notify: Restart microk8s service
+
+    - name: Apply pending restarts
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for MicroK8s to become ready after restart
+      ansible.builtin.command: "{{ microk8s_bin }} status --wait-ready"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ snap_bin_path }}"
       changed_when: false
-      failed_when: false
 
-    - name: Join MicroK8s cluster
-      ansible.builtin.shell: "{{ microk8s_worker_join_exec }}"
-      when: microk8s_worker_join_exec != '' and ('worker' not in (microk8s_status.stdout | default('')))
+  handlers:
+    - name: Restart microk8s service
+      ansible.builtin.command: snap restart microk8s
+      changed_when: true
+
+- name: Configure cluster CNI autodetection
+  hosts: master
+  become: true
+  vars:
+    microk8s_bin: /snap/bin/microk8s
+    snap_bin_path: /snap/bin
+    calico_autodetect_cidr: 192.168.1.0/24
+  tasks:
+    - name: Ensure MicroK8s is ready on master
+      ansible.builtin.command: "{{ microk8s_bin }} status --wait-ready"
+      environment:
+        PATH: "{{ ansible_env.PATH }}:{{ snap_bin_path }}"
+      changed_when: false
+
+    - name: Set Calico IP autodetection to site LAN
+      ansible.builtin.command: >-
+        {{ microk8s_bin }} kubectl -n kube-system set env daemonset/calico-node
+        IP_AUTODETECTION_METHOD=cidr={{ calico_autodetect_cidr }}
+      register: calico_env
+      changed_when: "'configured' in calico_env.stdout or 'set' in calico_env.stdout"
